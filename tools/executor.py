@@ -6,6 +6,7 @@ import subprocess
 import base64
 import glob
 from multiprocessing import Process, Queue
+from queue import Empty
 
 # ── Config ────────────────────────────────────────────────────
 CONTAINER_NAME    = "sandbox-merged"
@@ -294,30 +295,66 @@ def _run_user(user_label: str, filepath: str, request_dir: str, queue: Queue):
     Each Process calls this independently.
     Runs the solution.py file and collects any generated plots.
     """
-    # Extract the directory from filepath to set as working directory
-    request_dir_only = str(os.path.dirname(filepath))
-    filename_only = os.path.basename(filepath)
-    
-    result = subprocess.run(
-        ["docker", "exec", "-w", request_dir_only, CONTAINER_NAME, PYTHON_BIN, filename_only],
-        capture_output=True,
-        text=True,
-    )
+    try:
+        # Extract the directory from filepath to set as working directory
+        request_dir_only = str(os.path.dirname(filepath))
+        filename_only = os.path.basename(filepath)
+        
+        result = subprocess.run(
+            ["docker", "exec", "-w", request_dir_only, CONTAINER_NAME, PYTHON_BIN, filename_only],
+            capture_output=True,
+            text=True,
+        )
 
-    if result.returncode == 0:
-        output = result.stdout.strip() or "✓ (no output)"
-        # Collect any generated plots
-        plots = _collect_plots(request_dir)
-        if plots:
-            output = f"{output}\n\n{plots}"
-    else:
-        # Show both stdout and stderr so errors are never silently empty
-        stdout = result.stdout.strip()
-        stderr = result.stderr.strip()
-        output = f"ERROR: {stderr or stdout or 'unknown error (no output captured)'}"
+        if result.returncode == 0:
+            output = result.stdout.strip() or "✓ (no output)"
+            # Collect any generated plots
+            plots = _collect_plots(request_dir)
+            if plots:
+                output = f"{output}\n\n{plots}"
+        else:
+            # Show both stdout and stderr so errors are never silently empty
+            stdout = result.stdout.strip()
+            stderr = result.stderr.strip()
+            output = f"ERROR: {stderr or stdout or 'unknown error (no output captured)'}"
+    except Exception as exc:
+        output = f"ERROR: worker failed before returning output: {exc}"
 
+    queue.put((user_label, output))
     print(f"  [User-{user_label}] Complete", flush=True)
-    queue.put(output)
+
+
+def _collect_worker_results(processes: list[tuple[str, Process]], queue: Queue) -> list[str]:
+    """
+    Drain worker results before joining processes.
+
+    Large plot payloads are sent through multiprocessing.Queue. If the parent
+    joins first, a child can block while flushing the queue and the parent can
+    wait forever. Reading as workers finish keeps the pipe drained.
+    """
+    results_by_user = {}
+
+    while len(results_by_user) < len(processes):
+        try:
+            user_label, output = queue.get(timeout=0.5)
+            results_by_user[user_label] = output
+            continue
+        except Empty:
+            pass
+
+        for user_label, process in processes:
+            if user_label in results_by_user:
+                continue
+            if process.exitcode is not None:
+                results_by_user[user_label] = (
+                    f"ERROR: worker exited without returning output "
+                    f"(exit code {process.exitcode})"
+                )
+
+    for _, process in processes:
+        process.join()
+
+    return [results_by_user[user_label] for user_label, _ in processes]
 
 # ─────────────────────────────────────────────────────────────
 # Public — called by the LangGraph tool
@@ -386,15 +423,14 @@ def run_all_users(code: str, files: dict = None) -> str:
     # ── 4. One Process per user — same file, separate processes ─
     queue     = Queue()
     processes = [
-        Process(target=_run_user, args=(user, filepath, request_dir, queue))
+        (user, Process(target=_run_user, args=(user, filepath, request_dir, queue)))
         for user in USERS
     ]
 
-    for p in processes:
+    for _, p in processes:
         p.start()
 
-    for p in processes:
-        p.join()
+    results = _collect_worker_results(processes, queue)
 
     # ── 5. Delete the request directory ───────────────────────
     subprocess.run(
@@ -404,8 +440,7 @@ def run_all_users(code: str, files: dict = None) -> str:
 
     print(f"  [Executor] Cleaned  → {request_dir}\n", flush=True)
 
-    # ── 6. Collect and return results ─────────────────────────
-    results = [queue.get() for _ in processes]
+    # ── 6. Return results ────────────────────────────────────
     return results[0] if results else "No output"
 
 
