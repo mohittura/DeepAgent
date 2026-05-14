@@ -3,6 +3,8 @@ import time
 import uuid
 import threading
 import subprocess
+import base64
+import glob
 from multiprocessing import Process, Queue
 
 # ── Config ────────────────────────────────────────────────────
@@ -11,7 +13,7 @@ DOCKER_IMAGE      = "sandbox-merged"
 PYTHON_BIN        = "/.venv/bin/python3"
 TMP_DIR           = "/app/tmp"
 FILENAME          = "solution.py"
-USERS             = ["A", "B"]
+USERS             = ["A"]
 
 INACTIVITY_LIMIT  = 30 * 60        # 30 minutes in seconds
 WATCHDOG_INTERVAL = 60              # check every 60 seconds
@@ -93,14 +95,43 @@ def _start_container():
     else:
         # Container doesn't exist at all — very first run ever
         print(f"  [Container] Running fresh container from image '{DOCKER_IMAGE}'...", flush=True)
-        subprocess.run([
-            "docker", "run",
-            "-d",                       # detached
-            "--name", CONTAINER_NAME,
-            DOCKER_IMAGE,
-            "sleep", "infinity",        # keep it alive indefinitely
-        ], check=True, capture_output=True)
-        time.sleep(2)
+        try:
+            subprocess.run([
+                "docker", "run",
+                "-d",                       # detached
+                "--name", CONTAINER_NAME,
+                DOCKER_IMAGE,
+                "sleep", "infinity",        # keep it alive indefinitely
+            ], check=True, capture_output=True)
+            time.sleep(2)
+        except subprocess.CalledProcessError as e:
+            error_msg = e.stderr.decode() if e.stderr else str(e)
+            if "Cannot connect to the Docker daemon" in error_msg or "docker daemon" in error_msg.lower():
+                raise RuntimeError(
+                    "Docker daemon is not running. Please start Docker Desktop or the Docker daemon and try again."
+                )
+            elif "No such image" in error_msg or "image not found" in error_msg.lower():
+                raise RuntimeError(
+                    f"Docker image '{DOCKER_IMAGE}' not found. Please build it first with: "
+                    f"docker build -t {DOCKER_IMAGE} ."
+                )
+            elif "already in use" in error_msg.lower():
+                # Container name collision — try to remove and retry
+                print(f"  [Container] Container name '{CONTAINER_NAME}' already in use, removing old container...", flush=True)
+                subprocess.run(
+                    ["docker", "rm", "-f", CONTAINER_NAME],
+                    capture_output=True,
+                )
+                subprocess.run([
+                    "docker", "run",
+                    "-d",
+                    "--name", CONTAINER_NAME,
+                    DOCKER_IMAGE,
+                    "sleep", "infinity",
+                ], check=True, capture_output=True)
+                time.sleep(2)
+            else:
+                raise RuntimeError(f"Failed to start Docker container: {error_msg}")
 
     # Ensure /app/tmp exists (important after a fresh container run)
     subprocess.run(
@@ -133,7 +164,11 @@ def _ensure_container_running():
     """
     if not _container_is_running():
         print(f"  [Container] Not running — waking up...", flush=True)
-        _start_container()
+        try:
+            _start_container()
+        except RuntimeError as e:
+            print(f"  [ERROR] {e}\n", flush=True)
+            raise
 
 
 # ─────────────────────────────────────────────────────────────
@@ -182,48 +217,128 @@ def start_watchdog():
     )
 
 
+def _wrap_code_with_plot_capture(code: str, request_dir: str) -> str:
+    """
+    Wrap user code with matplotlib backend setup and plot capture.
+
+    Strategy: set MPLBACKEND=Agg via os.environ BEFORE any matplotlib import
+    so the non-interactive backend is guaranteed regardless of import order.
+    With the Agg backend plt.show() is a no-op (figures stay open), so we
+    simply save every open figure in a footer after user code finishes.
+    No monkey-patching required.
+    """
+    header = (
+        'import os as _os\n'
+        'import sys as _sys\n'
+        '\n'
+        '# Force the non-interactive Agg backend before matplotlib is imported.\n'
+        '# Setting the env var here works even when user code does its own\n'
+        '# "import matplotlib.pyplot as plt" — backend is locked in at import time.\n'
+        '_os.environ["MPLBACKEND"] = "Agg"\n'
+        f'_PLOT_DIR = "{request_dir}"\n'
+        '\n'
+        '# ── user code ────────────────────────────────────────────────\n'
+    )
+
+    footer = (
+        '\n'
+        '# ── plot capture (runs after user code) ─────────────────────\n'
+        'try:\n'
+        '    import matplotlib.pyplot as _plt\n'
+        '    _open_figs = _plt.get_fignums()\n'
+        '    for _idx, _fnum in enumerate(_open_figs, start=1):\n'
+        '        _fig = _plt.figure(_fnum)\n'
+        '        _plot_path = _os.path.join(_PLOT_DIR, f"plot_{_idx:03d}.png")\n'
+        '        _fig.savefig(_plot_path, dpi=100, bbox_inches="tight")\n'
+        '        print(f"[PLOT SAVED] {_plot_path}", flush=True)\n'
+        '    if _open_figs:\n'
+        '        _plt.close("all")\n'
+        'except Exception as _exc:\n'
+        '    print(f"[PLOT CAPTURE ERROR] {_exc}", flush=True)\n'
+    )
+
+    return header + code + footer
+
 # ─────────────────────────────────────────────────────────────
-# Private — runs inside each spawned Process
+# Private — collects plot files
 # ─────────────────────────────────────────────────────────────
 
-def _run_user(user_label: str, filepath: str, queue: Queue):
+def _collect_plots(request_dir_in_container: str) -> str:
+    """Collect all PNG plots from the request directory and return as base64 embedded images."""
+    # Use docker exec to find PNG files in the container
+    result = subprocess.run(
+        ["docker", "exec", CONTAINER_NAME, "find", request_dir_in_container, "-name", "plot_*.png", "-type", "f"],
+        capture_output=True,
+        text=True,
+    )
+    
+    plot_files = result.stdout.strip().split('\n') if result.stdout.strip() else []
+    
+    output_parts = []
+    for plot_file in plot_files:
+        if plot_file:
+            # Read the PNG file from container and encode as base64
+            result = subprocess.run(
+                ["docker", "exec", CONTAINER_NAME, "base64", "-w", "0", plot_file],
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0:
+                base64_data = result.stdout.strip()
+                output_parts.append(f"[IMAGE]\n<img src='data:image/png;base64,{base64_data}' style='max-width:100%;' />\n[/IMAGE]")
+    
+    return "\n".join(output_parts) if output_parts else ""
+
+def _run_user(user_label: str, filepath: str, request_dir: str, queue: Queue):
     """
     Each Process calls this independently.
-    All processes point to the same solution.py inside the request directory.
-    Each gets its own OS PID and memory space — truly parallel.
+    Runs the solution.py file and collects any generated plots.
     """
+    # Extract the directory from filepath to set as working directory
+    request_dir_only = str(os.path.dirname(filepath))
+    filename_only = os.path.basename(filepath)
+    
     result = subprocess.run(
-        ["docker", "exec", CONTAINER_NAME, PYTHON_BIN, filepath],
+        ["docker", "exec", "-w", request_dir_only, CONTAINER_NAME, PYTHON_BIN, filename_only],
         capture_output=True,
         text=True,
     )
 
     if result.returncode == 0:
         output = result.stdout.strip() or "✓ (no output)"
+        # Collect any generated plots
+        plots = _collect_plots(request_dir)
+        if plots:
+            output = f"{output}\n\n{plots}"
     else:
         # Show both stdout and stderr so errors are never silently empty
         stdout = result.stdout.strip()
         stderr = result.stderr.strip()
         output = f"ERROR: {stderr or stdout or 'unknown error (no output captured)'}"
 
-    print(f"  [User-{user_label}] PID={os.getpid()} → {output}", flush=True)
-    queue.put(f"User-{user_label} (PID={os.getpid()}): {output}")
+    print(f"  [User-{user_label}] Complete", flush=True)
+    queue.put(output)
 
 # ─────────────────────────────────────────────────────────────
 # Public — called by the LangGraph tool
 # ─────────────────────────────────────────────────────────────
 
-def run_all_users(code: str) -> str:
+def run_all_users(code: str, files: dict = None) -> str:
     """
     Full lifecycle for one agent request:
 
         0. Record activity + ensure container is running (unpause if needed)
         1. Create a unique request directory  →  /app/tmp/<uuid>/
         2. Write solution.py ONCE            →  /app/tmp/<uuid>/solution.py
-        3. Spawn one Process per user        →  each runs the same file independently
-        4. Wait for all processes to finish
-        5. Delete the entire request directory
-        6. Return combined output
+        3. Copy any provided files to the request directory
+        4. Spawn one Process per user        →  each runs the same file independently
+        5. Wait for all processes to finish
+        6. Delete the entire request directory
+        7. Return combined output
+    
+    Args:
+        code: Python code to execute
+        files: Optional dict of {filename: content} to copy to sandbox
     """
 
     # ── 0. Track activity + wake container if paused/stopped ──
@@ -242,21 +357,36 @@ def run_all_users(code: str) -> str:
     )
 
     # ── 3. Write solution.py ONCE ─────────────────────────────
+    wrapped_code = _wrap_code_with_plot_capture(code, request_dir)
     subprocess.run(
         ["docker", "exec", "-i", CONTAINER_NAME,
          "bash", "-c", f"cat > {filepath}"],
-        input=code,
+        input=wrapped_code,
         text=True,
         check=True,
     )
 
     print(f"\n  [Executor] Written  → {filepath}", flush=True)
+
+    # ── 3b. Copy any provided files to the sandbox ─────────────
+    if files:
+        for filename, content in files.items():
+            file_path = f"{request_dir}/{filename}"
+            subprocess.run(
+                ["docker", "exec", "-i", CONTAINER_NAME,
+                 "bash", "-c", f"cat > {file_path}"],
+                input=content,
+                text=True,
+                check=True,
+            )
+            print(f"  [Executor] Copied   → {file_path}", flush=True)
+
     print(f"  [Executor] Spawning {len(USERS)} processes...\n", flush=True)
 
     # ── 4. One Process per user — same file, separate processes ─
     queue     = Queue()
     processes = [
-        Process(target=_run_user, args=(user, filepath, queue))
+        Process(target=_run_user, args=(user, filepath, request_dir, queue))
         for user in USERS
     ]
 
@@ -276,7 +406,7 @@ def run_all_users(code: str) -> str:
 
     # ── 6. Collect and return results ─────────────────────────
     results = [queue.get() for _ in processes]
-    return "\n".join(sorted(results))
+    return results[0] if results else "No output"
 
 
 # ── Start watchdog the moment this module is imported ─────────

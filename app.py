@@ -45,7 +45,8 @@ def _init_state():
     defaults = {
         "lc_messages": [],      # Full LangChain message list (passed to agent)
         "display_turns": [],    # List of turn dicts for display
-        "file_contexts": {},    # filename → text content
+        "file_contexts": {},    # filename → text content (for display/context)
+        "files_raw": {},        # filename → raw file content (for sandbox access)
         "dataframes": {},       # filename → pd.DataFrame
     }
     for k, v in defaults.items():
@@ -58,12 +59,16 @@ _init_state()
 # ─────────────────────────────────────────────────────────────
 # File processing
 # ─────────────────────────────────────────────────────────────
-def process_file(uploaded_file) -> tuple[str, Optional[pd.DataFrame]]:
-    """Return (text_content, dataframe_or_None) for any uploaded file type."""
+def process_file(uploaded_file) -> tuple[str, Optional[pd.DataFrame], Optional[str]]:
+    """Return (text_content, dataframe_or_None, raw_content_or_None) for any uploaded file type."""
     name = uploaded_file.name
     ext = Path(name).suffix.lower()
 
     if ext in (".csv",):
+        # Read raw CSV content first
+        raw_content = uploaded_file.read().decode("utf-8", errors="replace")
+        uploaded_file.seek(0)  # Reset for pandas read
+        
         df = pd.read_csv(uploaded_file)
         snippet = df.head(20).to_string()
         content = (
@@ -71,7 +76,7 @@ def process_file(uploaded_file) -> tuple[str, Optional[pd.DataFrame]]:
             f"Columns: {', '.join(df.columns.tolist())}\n\n"
             f"First 20 rows:\n{snippet}"
         )
-        return content, df
+        return content, df, raw_content
 
     elif ext in (".xlsx", ".xls"):
         df = pd.read_excel(uploaded_file)
@@ -81,43 +86,41 @@ def process_file(uploaded_file) -> tuple[str, Optional[pd.DataFrame]]:
             f"Columns: {', '.join(df.columns.tolist())}\n\n"
             f"First 20 rows:\n{snippet}"
         )
-        return content, df
+        return content, df, None
 
     elif ext in (".txt", ".md", ".py", ".js", ".ts", ".json", ".yaml", ".yml", ".toml", ".sh"):
         raw = uploaded_file.read().decode("utf-8", errors="replace")
-        return f"File '{name}':\n```\n{raw[:8000]}\n```", None
+        return f"File '{name}':\n```\n{raw[:8000]}\n```", None, raw
 
     elif ext == ".pdf":
         try:
-            
             with pdfplumber.open(uploaded_file) as pdf:
                 pages = [p.extract_text() or "" for p in pdf.pages]
             text = "\n\n".join(pages)[:12000]
-            return f"PDF '{name}' ({len(pages)} pages):\n{text}", None
+            return f"PDF '{name}' ({len(pages)} pages):\n{text}", None, None
         except ImportError:
-            return f"[PDF '{name}': install pdfplumber to extract text]", None
+            return f"[PDF '{name}': install pdfplumber to extract text]", None, None
 
     elif ext in (".docx",):
         try:
-            
             doc = _docx.Document(uploaded_file)
             text = "\n".join(p.text for p in doc.paragraphs)[:12000]
-            return f"Word document '{name}':\n{text}", None
+            return f"Word document '{name}':\n{text}", None, None
         except ImportError:
-            return f"[DOCX '{name}': install python-docx to extract text]", None
+            return f"[DOCX '{name}': install python-docx to extract text]", None, None
 
     elif ext in (".png", ".jpg", ".jpeg", ".gif", ".webp"):
         data = uploaded_file.read()
         b64 = base64.b64encode(data).decode()
         mime = "image/png" if ext == ".png" else "image/jpeg"
-        return f"[Image '{name}' ({len(data)//1024} KB) — passed as base64]", None
+        return f"[Image '{name}' ({len(data)//1024} KB) — passed as base64]", None, None
 
     else:
         try:
             raw = uploaded_file.read().decode("utf-8", errors="replace")
-            return f"File '{name}':\n{raw[:6000]}", None
+            return f"File '{name}':\n{raw[:6000]}", None, raw
         except Exception:
-            return f"[Binary file '{name}' — cannot display as text]", None
+            return f"[Binary file '{name}' — cannot display as text]", None, None
 
 
 def build_user_content(prompt: str) -> str:
@@ -148,8 +151,14 @@ async def _invoke_agent(user_content: str):
 
     # Pass full conversation history + new message
     all_messages = st.session_state.lc_messages + [new_msg]
+    
+    # Build initial state with files available to the agent
+    initial_state = {
+        "messages": all_messages,
+        "files": st.session_state.files_raw,  # Pass raw file contents to agent state
+    }
 
-    result = await agent.ainvoke({"messages": all_messages})
+    result = await agent.ainvoke(initial_state)
     return result
 
 
@@ -161,11 +170,11 @@ def render_csv_explorer(fname: str, df: pd.DataFrame):
         tab_data, tab_stats, tab_viz = st.tabs(["Data", "Statistics", "Visualize"])
 
         with tab_data:
-            st.dataframe(df, use_container_width=True, height=300)
+            st.dataframe(df, use_container_width='stretch', height=300)
 
         with tab_stats:
             desc = df.describe(include="all")
-            st.dataframe(desc, use_container_width=True)
+            st.dataframe(desc, use_container_width='stretch')
 
         with tab_viz:
             num_cols = df.select_dtypes(include="number").columns.tolist()
@@ -186,16 +195,15 @@ def render_csv_explorer(fname: str, df: pd.DataFrame):
                     x = st.selectbox("X", all_cols, key=f"sx_{fname}")
                     y = st.selectbox("Y", num_cols, key=f"sy_{fname}")
                     try:
-                        
                         st.plotly_chart(px.scatter(df, x=x, y=y, title=f"{x} vs {y}"),
-                                        use_container_width=True)
+                                        use_container_width='stretch')
                     except ImportError:
                         st.scatter_chart(df.set_index(x)[[y]])
 
                 elif chart_type == "Histogram":
                     col = st.selectbox("Column", num_cols, key=f"hc_{fname}")
                     try:
-                        st.plotly_chart(px.histogram(df, x=col), use_container_width=True)
+                        st.plotly_chart(px.histogram(df, x=col), use_container_width='stretch')
                     except ImportError:
                         st.bar_chart(df[col].value_counts())
 
@@ -271,12 +279,28 @@ def _render_one_message(msg):
         raw = format_message_content(msg)
 
         # Try to detect code execution results
-        is_sandbox = "Execution" in raw or "User-" in raw or "ERROR:" in raw
+        is_sandbox = "Execution" in raw or "User-" in raw or "ERROR:" in raw or "[IMAGE]" in raw
 
         if is_sandbox:
             label = "✅ Sandbox output" if "ERROR:" not in raw else "❌ Sandbox error"
-            with st.expander(label, expanded="ERROR:" in raw):
-                st.code(raw, language="text")
+            with st.expander(label, expanded="ERROR:" in raw or "[IMAGE]" in raw):
+                if "[IMAGE]" in raw:
+                    # Split on the [IMAGE]...[/IMAGE] blocks and render each piece
+                    # Format: text...[IMAGE]\n<img ... />\n[/IMAGE]text...
+                    import re
+                    segments = re.split(r"\[IMAGE\](.*?)\[/IMAGE\]", raw, flags=re.DOTALL)
+                    for idx, segment in enumerate(segments):
+                        if idx % 2 == 0:
+                            # Plain text segment
+                            if segment.strip():
+                                st.code(segment.strip(), language="text")
+                        else:
+                            # Image segment — contains the raw <img ...> tag
+                            img_tag = segment.strip()
+                            if img_tag.startswith("<img"):
+                                st.markdown(img_tag, unsafe_allow_html=True)
+                else:
+                    st.code(raw, language="text")
         else:
             with st.expander(f"📤 `{tool_name}`", expanded=False):
                 st.text(raw[:3000] + ("…" if len(raw) > 3000 else ""))
@@ -312,8 +336,10 @@ with st.sidebar:
         for f in uploaded_files:
             if f.name not in st.session_state.file_contexts:
                 with st.spinner(f"Processing {f.name}…"):
-                    content, df = process_file(f)
+                    content, df, raw = process_file(f)
                 st.session_state.file_contexts[f.name] = content
+                if raw is not None:
+                    st.session_state.files_raw[f.name] = raw
                 if df is not None:
                     st.session_state.dataframes[f.name] = df
                 st.toast(f"✅ {f.name} loaded", icon="📎")
@@ -330,6 +356,7 @@ with st.sidebar:
             )
             if col_btn.button("✕", key=f"rm_{fname}", help=f"Remove {fname}"):
                 del st.session_state.file_contexts[fname]
+                st.session_state.files_raw.pop(fname, None)
                 st.session_state.dataframes.pop(fname, None)
                 st.rerun()
 
@@ -338,13 +365,14 @@ with st.sidebar:
     # ── Controls ──────────────────────────────────────────────
     st.markdown("### ⚙️ Controls")
 
-    if st.button("🗑️  Clear conversation", use_container_width=True):
+    if st.button("🗑️  Clear conversation", use_container_width='stretch'):
         st.session_state.lc_messages = []
         st.session_state.display_turns = []
         st.rerun()
 
-    if st.button("🗂️  Clear files", use_container_width=True):
+    if st.button("🗂️  Clear files", use_container_width='stretch'):
         st.session_state.file_contexts = {}
+        st.session_state.files_raw = {}
         st.session_state.dataframes = {}
         st.rerun()
 

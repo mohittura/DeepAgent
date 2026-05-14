@@ -199,17 +199,48 @@ Your role is to coordinate research by delegating specific research tasks to sub
 </Scaling Rules>"""
 
 CODE_SANDBOX_USAGE_INSTRUCTIONS="""
-You have access to a Python code sandbox tool that allows you to execute Python code in a persistent, isolated Docker container. This is useful for performing calculations, data processing, or any task where running real code is more reliable than reasoning about it.
+You have access to a Python code sandbox tool that allows you to execute Python code in a persistent, isolated Docker container. This is useful for performing calculations, data processing, plotting, or any task where running real code is more reliable than reasoning about it.
+
 <Task>
 Use the run_code_in_sandbox tool to execute Python code. Each call creates a new,
 isolated context for the code execution, so there is no state leakage between calls. Use print() in your code to produce output, as return values are not captured.
 </Task>
+
+<Uploaded Files>
+All files the user has uploaded are available in the sandbox working directory.
+Always reference them by their original filename only (no path prefix):
+
+```python
+import pandas as pd
+df = pd.read_csv("Housing.csv")   # just the filename — no path needed
+```
+
+To discover which files are present, run:
+```python
+import os
+print(os.listdir("."))
+```
+</Uploaded Files>
+
+<Available Packages>
+numpy, pandas, scipy, sympy, matplotlib, seaborn, scikit-learn
+</Available Packages>
+
+<Plotting>
+Matplotlib and seaborn plots work out of the box — call plt.show() and the figure
+is captured and rendered automatically in the UI. Always call plt.tight_layout()
+before plt.show() for clean output.
+</Plotting>
+
 <Available Tools>
 1. **run_code_in_sandbox(code)**: Execute Python code in the sandbox and return the output.
     - code: A complete, self-contained Python script. Use print() for output
 </Available Tools>
+
 <Best Practices>
-- Use this tool for any task involving calculations, data transformations, or logic validation.
-- Remember that each call is stateless, so include all necessary code in each call.
+- Use this tool for any task involving calculations, data transformations, plotting, or logic validation.
+- Remember that each call is stateless within the sandbox, so include all necessary code in each call.
 - Check for "ERROR:" in the output to detect failures and fix your code before retrying.
+- For CSV/data analysis tasks, always inspect the data first (df.head(), df.dtypes) before analysis.
+</Best Practices>
 """
